@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROG_NAME="${0##*/}"
+PROG_NAME="${PROG_NAME:-sandbutter}"
+
+MACHINES_DIR="${SANDBUTTER_MACHINES_DIR:-${MACHINES_DIR:-/var/lib/machines}}"
+MACHINES_DIR="${MACHINES_DIR%/}"
+TARGET_USER="${TARGET_USER:-${SUDO_USER:-$USER}}"
+
+# Ensure root execution
+if [[ $EUID -ne 0 ]]; then
+    exec sudo --preserve-env=SANDBUTTER_MACHINES_DIR,TARGET_USER,USER "$0" "$@"
+fi
+
+usage() {
+    cat <<EOF
+Usage: $PROG_NAME <command> [arguments]
+
+Lifecycle Commands:
+  create <name>            Create a new CoW host snapshot sandbox
+  enter <name> [shell]     Drop into interactive shell as your regular user
+  root <name> [shell]      Drop into interactive shell as root
+  ephemeral <name> [shell] Run temporary session (changes discarded on exit)
+  list                     List all existing sandboxes
+  status <name>            Inspect subvolume details and extent state
+  delete <name>            Delete sandbox subvolumes and reclaim dirty extents
+
+Reflink / Data Commands:
+  pull <name> <path> [dst] Reflink-copy file/dir from sandbox to host (zero bytes written)
+  push <name> <path> [dst] Reflink-copy file/dir from host into sandbox
+  diff <name> <path> [dst] Diff file/dir between host and sandbox
+
+Diagnostic Commands:
+  check                    Verify system packages and Btrfs filesystem support
+EOF
+    exit 1
+}
+
+get_btrfs_uuid() {
+    local target_path="$1"
+    local mount_pt
+    mount_pt="$(findmnt -n -o TARGET -T "$target_path" 2>/dev/null || true)"
+    if [[ -n "$mount_pt" ]]; then
+        btrfs filesystem show "$mount_pt" 2>/dev/null | awk '/uuid:/ {print $NF; exit}'
+    else
+        btrfs filesystem show "$target_path" 2>/dev/null | awk '/uuid:/ {print $NF; exit}'
+    fi
+}
+
+get_subvol_name() {
+    local target_path="$1"
+    if [[ -d "$target_path" ]] && btrfs subvolume show "$target_path" &>/dev/null; then
+        btrfs subvolume show "$target_path" 2>/dev/null | awk '/Name:/ {print $NF; exit}'
+    else
+        echo "(not a subvolume)"
+    fi
+}
+
+is_btrfs_subvolume() {
+    local p="$1"
+    [[ -d "$p" ]] && btrfs subvolume show "$p" &>/dev/null
+}
+
+is_excluded_mount() {
+    local m="$1"
+    case "$m" in
+        /|/.snapshots*|*/.snapshots*|/tmp*|/run*|/proc*|/sys*|/dev*|/var/log*) return 0 ;;
+        */storage-pools*|*/docker*|*/containers*|*/incus*|*/lxc*|*/libvirt*) return 0 ;;
+    esac
+    if [[ "$m" == "$MACHINES_DIR"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+resolve_abs() {
+    local p="$1"
+    if [[ "$p" != /* ]]; then
+        echo "$(pwd)/$p"
+    else
+        echo "$p"
+    fi
+}
+
+validate_sandbox_name() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Error: Sandbox name cannot be empty." >&2
+        exit 1
+    fi
+    if [[ "$name" == "." || "$name" == ".." || "$name" =~ / || "$name" =~ [[:space:]] ]]; then
+        echo "Error: Invalid sandbox name '$name'. Must not contain '/', spaces, or path traversal elements ('..')." >&2
+        exit 1
+    fi
+}
+
+require_sandbox() {
+    local name="$1"
+    validate_sandbox_name "$name"
+    local path="$MACHINES_DIR/$name"
+
+    # Safety guard: ensure the target is strictly inside MACHINES_DIR and not MACHINES_DIR itself
+    local real_machines real_path
+    real_machines="$(realpath -q "$MACHINES_DIR" 2>/dev/null || echo "$MACHINES_DIR")"
+    real_path="$(realpath -q "$path" 2>/dev/null || echo "")"
+    if [[ -z "$real_path" || "$real_path" == "$real_machines" || "$real_path" != "$real_machines/"* ]]; then
+        echo "Error: Safety check failed: target '$path' is not inside '$MACHINES_DIR'." >&2
+        exit 1
+    fi
+
+    if [[ ! -d "$path" ]] || ! btrfs subvolume show "$path" &>/dev/null; then
+        echo "Error: Sandbox '$name' not found at '$path'." >&2
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local missing=()
+    if ! command -v btrfs &>/dev/null; then
+        missing+=("btrfs (package: btrfs-progs)")
+    fi
+    if ! command -v systemd-nspawn &>/dev/null; then
+        missing+=("systemd-nspawn (package: systemd-container)")
+    fi
+    if ! command -v findmnt &>/dev/null; then
+        missing+=("findmnt (package: util-linux)")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required system dependencies:" >&2
+        for item in "${missing[@]}"; do
+            echo "  - $item" >&2
+        done
+        echo "" >&2
+        echo "Please install the missing packages:" >&2
+        echo "  Debian/Ubuntu:  apt install systemd-container btrfs-progs" >&2
+        echo "  Fedora/RHEL:    dnf install systemd-container btrfs-progs" >&2
+        echo "  Arch Linux:     pacman -S systemd btrfs-progs" >&2
+        echo "  openSUSE:       zypper install systemd-container btrfs-progs" >&2
+        exit 1
+    fi
+}
+
+check_filesystem_support() {
+    local root_fstype
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || stat -f -c %T / 2>/dev/null || echo "unknown")"
+    if [[ "$root_fstype" != "btrfs" ]]; then
+        echo "Error: Root filesystem (/) is not Btrfs (found: $root_fstype)." >&2
+        echo "$PROG_NAME requires a Btrfs root filesystem for instant zero-cost CoW snapshots." >&2
+        exit 1
+    fi
+
+    if ! is_btrfs_subvolume /; then
+        echo "Error: Root filesystem (/) is not recognized as a Btrfs subvolume." >&2
+        exit 1
+    fi
+
+    local root_uuid
+    root_uuid="$(get_btrfs_uuid /)"
+
+    local check_dir="$MACHINES_DIR"
+    while [[ ! -d "$check_dir" && "$check_dir" != "/" ]]; do
+        check_dir="$(dirname "$check_dir")"
+    done
+    local machines_uuid
+    machines_uuid="$(get_btrfs_uuid "$check_dir")"
+
+    if [[ -n "$root_uuid" && -n "$machines_uuid" && "$root_uuid" != "$machines_uuid" ]]; then
+        echo "Error: Machines directory '$MACHINES_DIR' is on a different filesystem than '/'." >&2
+        echo "  Root FS UUID:     $root_uuid" >&2
+        echo "  Machines FS UUID: $machines_uuid" >&2
+        echo "Btrfs CoW snapshots cannot span across different filesystems." >&2
+        echo "Please set SANDBUTTER_MACHINES_DIR to a path on the root Btrfs filesystem." >&2
+        exit 1
+    fi
+}
+
+check_system_support() {
+    check_dependencies
+    check_filesystem_support
+}
+
+ensure_machines_dir() {
+    if [[ ! -d "$MACHINES_DIR" ]]; then
+        btrfs subvolume create "$MACHINES_DIR" 2>/dev/null || mkdir -p "$MACHINES_DIR"
+    fi
+}
+
+cmd_check() {
+    echo "=== Sandbutter System & Btrfs Compatibility Check ==="
+    echo ""
+    echo "--- 1. Dependency Checks ---"
+    local tools=("btrfs:btrfs-progs" "systemd-nspawn:systemd-container" "findmnt:util-linux" "cp:coreutils")
+    local all_tools_ok=true
+    for item in "${tools[@]}"; do
+        local tool="${item%%:*}"
+        local pkg="${item##*:}"
+        if command -v "$tool" &>/dev/null; then
+            local ver
+            ver="$("$tool" --version 2>&1 | head -n1 || echo "installed")"
+            echo "  [OK] $tool ($ver)"
+        else
+            echo "  [FAIL] $tool is missing (package: $pkg)"
+            all_tools_ok=false
+        fi
+    done
+
+    echo ""
+    echo "--- 2. Filesystem & Btrfs Layout Analysis ---"
+    local root_fstype root_subvol root_uuid
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || stat -f -c %T / 2>/dev/null || echo "unknown")"
+    echo "  Root mount (/) filesystem: $root_fstype"
+    if [[ "$root_fstype" != "btrfs" ]]; then
+        echo "  [FAIL] Root filesystem is not Btrfs. Zero-cost CoW snapshots require Btrfs."
+    else
+        root_subvol="$(get_subvol_name /)"
+        root_uuid="$(get_btrfs_uuid /)"
+        echo "  [OK] Root Btrfs Subvolume: $root_subvol"
+        echo "  [OK] Root Btrfs FS UUID:   $root_uuid"
+    fi
+
+    echo ""
+    echo "  Sandbox directory: $MACHINES_DIR"
+    local check_dir="$MACHINES_DIR"
+    while [[ ! -d "$check_dir" && "$check_dir" != "/" ]]; do
+        check_dir="$(dirname "$check_dir")"
+    done
+    local machines_uuid
+    machines_uuid="$(get_btrfs_uuid "$check_dir")"
+    if [[ -z "$machines_uuid" ]]; then
+        echo "  [FAIL] Sandbox directory parent is not on a Btrfs filesystem."
+    elif [[ "$machines_uuid" != "$root_uuid" ]]; then
+        echo "  [FAIL] Sandbox directory is on a different filesystem than /."
+        echo "         Root FS UUID:     $root_uuid"
+        echo "         Machines FS UUID: $machines_uuid"
+        echo "         CoW snapshots cannot cross filesystem boundaries."
+    else
+        echo "  [OK] Sandbox directory is on the same Btrfs filesystem as /."
+    fi
+
+    echo ""
+    echo "  Home directory (/home):"
+    local home_subvol home_uuid
+    home_subvol="$(get_subvol_name /home)"
+    home_uuid="$(get_btrfs_uuid /home)"
+    if [[ "$home_subvol" != "(not a subvolume)" ]]; then
+        if [[ "$home_uuid" == "$root_uuid" ]]; then
+            echo "  [OK] /home is subvolume '$home_subvol' on same Btrfs filesystem."
+            echo "       -> Will be snapshotted automatically alongside /."
+        else
+            echo "  [NOTE] /home is on a separate filesystem ($home_uuid)."
+            echo "         -> Btrfs CoW snapshotting across filesystems is not supported."
+        fi
+    else
+        echo "  [OK] /home is a standard directory inside root subvolume."
+        echo "       -> Automatically included in root snapshot."
+    fi
+
+    echo ""
+    echo "  Root user home (/root):"
+    local root_user_subvol root_user_uuid
+    root_user_subvol="$(get_subvol_name /root)"
+    root_user_uuid="$(get_btrfs_uuid /root)"
+    if [[ "$root_user_subvol" != "(not a subvolume)" ]]; then
+        if [[ "$root_user_uuid" == "$root_uuid" ]]; then
+            echo "  [OK] /root is subvolume '$root_user_subvol' on same Btrfs filesystem."
+            echo "       -> Will be snapshotted automatically alongside /."
+        fi
+    else
+        echo "  [OK] /root is inside root subvolume (automatically included)."
+    fi
+
+    echo ""
+    echo "--- 3. Other Btrfs Mounts on Root Filesystem ---"
+    local found_other=false
+    while read -r target fstype; do
+        [[ -z "$target" || "$target" == "/" || "$target" == "/home" || "$target" == "/root" ]] && continue
+        [[ "$fstype" != "btrfs" ]] && continue
+        local t_uuid
+        t_uuid="$(get_btrfs_uuid "$target")"
+        if [[ "$t_uuid" == "$root_uuid" ]]; then
+            found_other=true
+            if is_excluded_mount "$target"; then
+                echo "  [EXCLUDED] $target (ephemeral/internal/snapshot directory, skipped on create)"
+            else
+                echo "  [INCLUDED] $target (will be snapshotted into sandbox)"
+            fi
+        fi
+    done < <(findmnt -l -n -o TARGET,FSTYPE 2>/dev/null || true)
+    if ! $found_other; then
+        echo "  None found."
+    fi
+
+    echo ""
+    echo "=== Summary ==="
+    if $all_tools_ok && [[ "$root_fstype" == "btrfs" && "$machines_uuid" == "$root_uuid" ]]; then
+        echo "System is fully supported! You can run '$PROG_NAME create <name>'."
+    else
+        echo "System compatibility issues detected. Please review the [FAIL] items above."
+    fi
+}
+
+cmd_create() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    if [[ "$name" =~ [/[:space:]] ]]; then
+        echo "Error: Sandbox name '$name' contains invalid characters." >&2
+        exit 1
+    fi
+
+    local target="$MACHINES_DIR/$name"
+    if [[ -e "$target" ]]; then
+        echo "Error: Target '$target' already exists." >&2
+        exit 1
+    fi
+
+    check_system_support
+    ensure_machines_dir
+
+    echo "==> Creating root filesystem snapshot at $target..."
+    btrfs subvolume snapshot / "$target"
+
+    local root_uuid
+    root_uuid="$(get_btrfs_uuid /)"
+
+    # Identify and snapshot any subvolumes mounted under / on the same Btrfs filesystem
+    # Sorted by depth so shallower paths are snapshotted before child paths
+    local subvolumes_to_snapshot=()
+    while IFS= read -r mount_pt; do
+        [[ -z "$mount_pt" || "$mount_pt" == "/" ]] && continue
+        if is_excluded_mount "$mount_pt"; then
+            continue
+        fi
+        local m_uuid
+        m_uuid="$(get_btrfs_uuid "$mount_pt")"
+        if [[ "$m_uuid" == "$root_uuid" ]]; then
+            subvolumes_to_snapshot+=("$mount_pt")
+        fi
+    done < <(findmnt -l -n -o TARGET -t btrfs 2>/dev/null | awk '{ print length, $0 }' | sort -n -s | cut -d" " -f2-)
+
+    for m_pt in "${subvolumes_to_snapshot[@]}"; do
+        local rel="${m_pt#/}"
+        local sub_dst="$target/$rel"
+        echo "==> Snapshotting $m_pt into sandbox..."
+        if [[ -d "$sub_dst" ]]; then
+            rmdir "$sub_dst" 2>/dev/null || rm -rf "$sub_dst"
+        else
+            mkdir -p "$(dirname "$sub_dst")"
+        fi
+        btrfs subvolume snapshot "$m_pt" "$sub_dst"
+    done
+
+    # Inform user about /home status if not explicitly snapshotted
+    if ! printf '%s\n' "${subvolumes_to_snapshot[@]}" | grep -qx "/home"; then
+        if is_btrfs_subvolume /home; then
+            echo "==> Warning: /home is on a separate filesystem. It was not snapshotted into the sandbox."
+        else
+            echo "==> Note: /home is part of the root subvolume (already included in snapshot)."
+        fi
+    fi
+
+    # Inform user about /root status if not explicitly snapshotted
+    if ! printf '%s\n' "${subvolumes_to_snapshot[@]}" | grep -qx "/root"; then
+        if is_btrfs_subvolume /root; then
+            echo "==> Warning: /root is on a separate filesystem. It was not snapshotted into the sandbox."
+        fi
+    fi
+
+    echo "==> Sandbox '$name' ready. Enter with: $PROG_NAME enter $name"
+}
+
+resolve_shell() {
+    local target="$1"
+    local s="$2"
+    if [[ "$s" == /* ]]; then
+        if [[ -x "$target$s" ]]; then
+            echo "$s"
+            return 0
+        fi
+    else
+        for dir in /usr/bin /bin /usr/local/bin /usr/sbin /sbin; do
+            if [[ -x "$target$dir/$s" ]]; then
+                echo "$dir/$s"
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+parse_exec_command() {
+    local target="$1"
+    local name="$2"
+    shift 2
+
+    local shell_bin=""
+    local cmd_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--shell)
+                [[ $# -lt 2 ]] && { echo "Error: $1 requires a shell path or name." >&2; exit 1; }
+                shell_bin="$2"
+                shift 2
+                ;;
+            --shell=*)
+                shell_bin="${1#*=}"
+                shift
+                ;;
+            --)
+                shift
+                cmd_args+=("$@")
+                break
+                ;;
+            *)
+                if [[ -z "$shell_bin" && ${#cmd_args[@]} -eq 0 ]]; then
+                    shell_bin="$1"
+                    shift
+                else
+                    cmd_args+=("$1")
+                    shift
+                fi
+                ;;
+        esac
+    done
+
+    EXEC_CMD=()
+    if [[ -n "$shell_bin" ]]; then
+        local resolved
+        if resolved="$(resolve_shell "$target" "$shell_bin")"; then
+            EXEC_CMD=("$resolved" "${cmd_args[@]}")
+        else
+            echo "Error: Specified shell '$shell_bin' not found or not executable inside sandbox '$name'." >&2
+            if [[ -f "$target/etc/shells" ]]; then
+                echo "Available shells in sandbox:" >&2
+                grep -v '^#' "$target/etc/shells" | sed 's/^/  - /' >&2
+            fi
+            exit 1
+        fi
+    elif [[ ${#cmd_args[@]} -gt 0 ]]; then
+        EXEC_CMD=("${cmd_args[@]}")
+    fi
+}
+
+cmd_enter() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    require_sandbox "$name"
+    check_dependencies
+    shift
+
+    local target="$MACHINES_DIR/$name"
+    local bind_args=()
+    if [[ -d /tmp/.X11-unix ]]; then
+        bind_args+=(--bind-ro=/tmp/.X11-unix)
+    fi
+
+    # Ensure user home directory exists in sandbox so shell initialization succeeds
+    local user_home
+    user_home="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    user_home="${user_home:-/home/$TARGET_USER}"
+    if [[ ! -d "$target$user_home" ]]; then
+        mkdir -p "$target$user_home"
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target$user_home" 2>/dev/null || true
+    fi
+
+    local EXEC_CMD=()
+    parse_exec_command "$target" "$name" "$@"
+
+    systemd-nspawn -D "$target" --user="$TARGET_USER" "${bind_args[@]}" "${EXEC_CMD[@]}"
+}
+
+cmd_root() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    require_sandbox "$name"
+    check_dependencies
+    shift
+
+    local target="$MACHINES_DIR/$name"
+    local bind_args=()
+    if [[ -d /tmp/.X11-unix ]]; then
+        bind_args+=(--bind-ro=/tmp/.X11-unix)
+    fi
+
+    local EXEC_CMD=()
+    parse_exec_command "$target" "$name" "$@"
+
+    systemd-nspawn -D "$target" "${bind_args[@]}" "${EXEC_CMD[@]}"
+}
+
+cmd_ephemeral() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    require_sandbox "$name"
+    check_dependencies
+    shift
+
+    local target="$MACHINES_DIR/$name"
+    local bind_args=()
+    if [[ -d /tmp/.X11-unix ]]; then
+        bind_args+=(--bind-ro=/tmp/.X11-unix)
+    fi
+
+    local user_home
+    user_home="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    user_home="${user_home:-/home/$TARGET_USER}"
+    if [[ ! -d "$target$user_home" ]]; then
+        mkdir -p "$target$user_home"
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target$user_home" 2>/dev/null || true
+    fi
+
+    local EXEC_CMD=()
+    parse_exec_command "$target" "$name" "$@"
+
+    systemd-nspawn -D "$target" --ephemeral --user="$TARGET_USER" "${bind_args[@]}" "${EXEC_CMD[@]}"
+}
+
+cmd_pull() {
+    local name="${1:-}"
+    local path="${2:-}"
+    local dest="${3:-$path}"
+
+    [[ -z "$name" || -z "$path" ]] && { echo "Error: Usage: $PROG_NAME pull <name> <path> [destination]" >&2; exit 1; }
+    require_sandbox "$name"
+    check_dependencies
+
+    local abs_src
+    abs_src="$(resolve_abs "$path")"
+    local abs_dst
+    abs_dst="$(resolve_abs "$dest")"
+    if [[ "$abs_dst" == "/" ]]; then
+        echo "Error: Safety guard: destination cannot be root directory '/'." >&2
+        exit 1
+    fi
+    local sandbox_src="$MACHINES_DIR/$name$abs_src"
+
+    if [[ ! -e "$sandbox_src" ]]; then
+        echo "Error: Source path '$sandbox_src' does not exist inside sandbox." >&2
+        exit 1
+    fi
+
+    local dst_parent
+    dst_parent="$(dirname "$abs_dst")"
+    while [[ ! -d "$dst_parent" && "$dst_parent" != "/" ]]; do
+        dst_parent="$(dirname "$dst_parent")"
+    done
+
+    local src_uuid dst_uuid
+    src_uuid="$(get_btrfs_uuid "$sandbox_src")"
+    dst_uuid="$(get_btrfs_uuid "$dst_parent")"
+
+    local reflink_opt="--reflink=always"
+    if [[ -n "$src_uuid" && -n "$dst_uuid" && "$src_uuid" != "$dst_uuid" ]]; then
+        echo "==> Note: Destination is on a different filesystem. Reflink not supported; falling back to copy."
+        reflink_opt="--reflink=auto"
+    fi
+
+    echo "==> Reflinking from sandbox ($name:$abs_src) to host ($abs_dst)..."
+    if [[ -d "$sandbox_src" ]]; then
+        mkdir -p "$abs_dst"
+        cp -a "$reflink_opt" "$sandbox_src/." "$abs_dst/"
+    else
+        mkdir -p "$(dirname "$abs_dst")"
+        cp -a "$reflink_opt" "$sandbox_src" "$abs_dst"
+    fi
+
+    # Fix ownership if target is within host user's home
+    local user_home
+    user_home="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    user_home="${user_home:-/home/$TARGET_USER}"
+    if [[ -n "$TARGET_USER" && "$abs_dst" == "$user_home"* ]]; then
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$abs_dst"
+    fi
+
+    if [[ "$reflink_opt" == "--reflink=always" ]]; then
+        echo "==> Pull complete. Zero disk bytes written."
+    else
+        echo "==> Pull complete."
+    fi
+}
+
+cmd_push() {
+    local name="${1:-}"
+    local path="${2:-}"
+    local dest="${3:-$path}"
+
+    [[ -z "$name" || -z "$path" ]] && { echo "Error: Usage: $PROG_NAME push <name> <path> [destination]" >&2; exit 1; }
+    require_sandbox "$name"
+    check_dependencies
+
+    local abs_src
+    abs_src="$(resolve_abs "$path")"
+    local abs_dst
+    abs_dst="$(resolve_abs "$dest")"
+    local sandbox_dst="$MACHINES_DIR/$name$abs_dst"
+
+    if [[ ! -e "$abs_src" ]]; then
+        echo "Error: Source path '$abs_src' does not exist on host." >&2
+        exit 1
+    fi
+
+    local src_parent
+    src_parent="$(dirname "$abs_src")"
+    while [[ ! -d "$src_parent" && "$src_parent" != "/" ]]; do
+        src_parent="$(dirname "$src_parent")"
+    done
+
+    local src_uuid dst_uuid
+    src_uuid="$(get_btrfs_uuid "$src_parent")"
+    dst_uuid="$(get_btrfs_uuid "$MACHINES_DIR/$name")"
+
+    local reflink_opt="--reflink=always"
+    if [[ -n "$src_uuid" && -n "$dst_uuid" && "$src_uuid" != "$dst_uuid" ]]; then
+        echo "==> Note: Source is on a different filesystem. Reflink not supported; falling back to copy."
+        reflink_opt="--reflink=auto"
+    fi
+
+    echo "==> Reflinking from host ($abs_src) to sandbox ($name:$abs_dst)..."
+    if [[ -d "$abs_src" ]]; then
+        mkdir -p "$sandbox_dst"
+        cp -a "$reflink_opt" "$abs_src/." "$sandbox_dst/"
+    else
+        mkdir -p "$(dirname "$sandbox_dst")"
+        cp -a "$reflink_opt" "$abs_src" "$sandbox_dst"
+    fi
+
+    if [[ "$reflink_opt" == "--reflink=always" ]]; then
+        echo "==> Push complete. Zero disk bytes written."
+    else
+        echo "==> Push complete."
+    fi
+}
+
+cmd_diff() {
+    local name="${1:-}"
+    local path="${2:-}"
+    local dest="${3:-$path}"
+
+    [[ -z "$name" || -z "$path" ]] && { echo "Error: Usage: $PROG_NAME diff <name> <path> [destination]" >&2; exit 1; }
+    require_sandbox "$name"
+
+    local abs_host
+    abs_host="$(resolve_abs "$dest")"
+    local abs_sandbox="$MACHINES_DIR/$name$(resolve_abs "$path")"
+
+    if command -v git &>/dev/null; then
+        git diff --no-index --color=always "$abs_host" "$abs_sandbox" || true
+    else
+        diff -u --color=always "$abs_host" "$abs_sandbox" || true
+    fi
+}
+
+cmd_list() {
+    check_dependencies
+    echo "Sandboxes located in $MACHINES_DIR:"
+    if [[ ! -d "$MACHINES_DIR" ]]; then
+        echo "  (none)"
+        return 0
+    fi
+
+    local count=0
+    for dir in "$MACHINES_DIR"/*; do
+        if [[ -d "$dir" ]] && btrfs subvolume show "$dir" &>/dev/null; then
+            echo "  - $(basename "$dir")"
+            count=$((count + 1))
+        fi
+    done
+    if [[ $count -eq 0 ]]; then
+        echo "  (none)"
+    fi
+    return 0
+}
+
+cmd_status() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    require_sandbox "$name"
+    check_dependencies
+
+    local target="$MACHINES_DIR/$name"
+    echo "=== Root Subvolume ($name) ==="
+    btrfs subvolume show "$target"
+
+    local nested
+    nested="$(btrfs subvolume list -o "$target" 2>/dev/null || true)"
+    if [[ -n "$nested" ]]; then
+        echo ""
+        echo "=== Child Subvolumes ==="
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local sub_path
+            sub_path="$(echo "$line" | awk '{print $NF}')"
+            echo "  - $sub_path"
+        done <<< "$nested"
+    fi
+    return 0
+}
+
+cmd_delete() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Error: Missing sandbox name." >&2; usage; }
+    require_sandbox "$name"
+    check_dependencies
+
+    local target="$MACHINES_DIR/$name"
+    if [[ -z "$name" || "$target" == "/" || "$target" == "$MACHINES_DIR" ]]; then
+        echo "Error: Safety guard: refusing to delete '$target'." >&2
+        exit 1
+    fi
+    echo "==> Deleting sandbox '$name'..."
+
+    # Use recursive deletion if supported by btrfs-progs
+    if btrfs subvolume delete -R "$target" &>/dev/null; then
+        echo "==> Successfully deleted '$name'."
+        return 0
+    fi
+
+    # Fallback for older btrfs-progs without -R:
+    # Delete child subvolumes bottom-up
+    while IFS= read -r subvol_path; do
+        if [[ -n "$subvol_path" ]]; then
+            btrfs subvolume delete "$subvol_path" 2>/dev/null || true
+        fi
+    done < <(btrfs subvolume list -o "$target" 2>/dev/null | awk '{print $NF}' | sort -r)
+
+    btrfs subvolume delete "$target"
+    echo "==> Successfully deleted '$name'."
+    return 0
+}
+
+case "${1:-}" in
+    create)        cmd_create "${2:-}" ;;
+    enter)         cmd_enter "${2:-}" "${@:3}" ;;
+    root)          cmd_root "${2:-}" "${@:3}" ;;
+    ephemeral)     cmd_ephemeral "${2:-}" "${@:3}" ;;
+    pull)          cmd_pull "${2:-}" "${3:-}" "${4:-}" ;;
+    push)          cmd_push "${2:-}" "${3:-}" "${4:-}" ;;
+    diff)          cmd_diff "${2:-}" "${3:-}" "${4:-}" ;;
+    list)          cmd_list ;;
+    status)        cmd_status "${2:-}" ;;
+    delete)        cmd_delete "${2:-}" ;;
+    check|doctor)  cmd_check ;;
+    -h|--help|help) usage ;;
+    *)             usage ;;
+esac
