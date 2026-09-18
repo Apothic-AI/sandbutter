@@ -21,6 +21,9 @@ Autonomous coding agents (Pi, Claude Code, Codex, OpenClaw, etc.) are at their b
 - 🧰 **Zero Setup Time & Full Parity**: Unlike Docker containers or virtual machines, sandbutter gives the agent immediate access to your existing files, tools, compilers, shell configs, and runtimes without wasting time reinstalling packages, copying files, or setting up bind mounts.
 - 🔄 **Effortless Work Extraction**: Once the agent produces a working build or file change, cleanly pull the results back to your host in zero bytes using `sandbutter pull`.
 
+> [!NOTE]
+> **Security Model**: sandbutter is built for developer productivity, blast-radius containment, and accident protection (safeguarding your workstation from runaway deletions like `rm -rf /`, conflicting dependencies, or corrupted system configs). It prioritizes 100% full host parity and is not intended to guard against actively malicious code or advanced container breakout exploits.
+
 ---
 
 ## Features
