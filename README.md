@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/Apothic-AI/sandbutter/blob/master/assets/sandbutter-logo.png?raw=true" alt="sandbutter" width="360">
+</p>
+
 # sandbutter
 
 **sandbutter** is a lightweight, zero-cost Copy-on-Write (CoW) sandbox manager for Linux. It creates instant clones of your running host operating system using **Btrfs snapshots** and drops you into isolated, fully functional container environments using **`systemd-nspawn`**.
