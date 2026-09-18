@@ -29,7 +29,7 @@ Autonomous coding agents (Pi, Claude Code, Codex, OpenClaw, etc.) are at their b
 ## Features
 
 - ⚡ **Instant Zero-Cost Clones**: Create complete host OS sandboxes in milliseconds via Btrfs CoW snapshots with zero overhead, disk space or otherwise.
-- 🐧 **Full Host Parity**: Mirrors your running environment, packages, dotfiles, and users inside the sandbox.
+- 🐧 **Full Host Parity**: Mirrors your running environment, packages, users, and entire filesystem inside the sandbox.
 - 🐚 **Custom Shell Support**: Launch directly into your preferred shell (`bash`, `zsh`, `fish`, `tmux`, etc.) or custom commands.
 - 💨 **Ephemeral Sessions**: Spin up temporary disposable containers where all changes are discarded on exit (`sandbutter ephemeral`).
 - 🔄 **Reflink Data Exchange**: Zero-copy data sharing between sandbox and host via `pull` and `push` with Btrfs extent reflinking.
