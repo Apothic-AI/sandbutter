@@ -18,7 +18,7 @@ Autonomous coding agents (such as Claude Code, Codex, Aider, OpenClaw, or Antigr
 
 - 🛡️ **Fearless Unrestricted Access**: Give your agent full `root` privileges, free rein to run any command and modify any file. Any broken packages, corrupted configurations, or accidental deletions remain strictly isolated within the sandbox.
 - ⚡ **Instant Disposable Workspaces**: Launch a temporary session using `sandbutter ephemeral <name>`. If the agent hallucinates or breaks the system environment, simply exit and every modification disappears instantly.
-- 🧰 **Zero Setup Time & Full Parity**: Unlike clean Docker containers or blank virtual machines, sandbutter gives the agent immediate access to your existing dev tools, compilers, shell configs, dotfiles, and language runtimes without wasting time reinstalling packages.
+- 🧰 **Zero Setup Time & Full Parity**: Unlike Docker containers or virtual machines, sandbutter gives the agent immediate access to your existing files, tools, compilers, shell configs, and runtimes without wasting time reinstalling packages, copying files, or setting up bind mounts.
 - 🔄 **Effortless Work Extraction**: Once the agent produces a working build or file change, cleanly pull the results back to your host in zero bytes using `sandbutter pull`.
 
 ---
