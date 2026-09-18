@@ -12,7 +12,7 @@ Because sandboxes leverage Btrfs subvolume snapshots, creating a sandbox takes m
 
 ## Great for AI Agents
 
-Autonomous coding agents (such as Claude Code, Codex, Aider, OpenClaw, or Antigravity) are at their best when given unrestricted terminal access: installing system packages, tweaking system configurations, managing services, and running arbitrary build commands. However, giving an AI agent direct root or shell access to your primary host workstation carries major risks of accidental file deletions, conflicting packages, or system corruption.
+Autonomous coding agents (Pi, Claude Code, Codex, OpenClaw, etc.) are at their best when given unrestricted terminal access: installing system packages, tweaking system configurations, managing services, and running arbitrary build commands. However, giving an AI agent direct root or shell access to your primary host workstation carries major risks of accidental file deletions, conflicting packages, or system corruption.
 
 **sandbutter** provides the ultimate sandbox for AI agents:
 
@@ -25,7 +25,7 @@ Autonomous coding agents (such as Claude Code, Codex, Aider, OpenClaw, or Antigr
 
 ## Features
 
-- ⚡ **Instant Zero-Cost Clones**: Create complete host OS sandboxes in milliseconds via Btrfs CoW snapshots.
+- ⚡ **Instant Zero-Cost Clones**: Create complete host OS sandboxes in milliseconds via Btrfs CoW snapshots with zero overhead, disk space or otherwise.
 - 🐧 **Full Host Parity**: Mirrors your running environment, packages, dotfiles, and users inside the sandbox.
 - 🐚 **Custom Shell Support**: Launch directly into your preferred shell (`bash`, `zsh`, `fish`, `tmux`, etc.) or custom commands.
 - 💨 **Ephemeral Sessions**: Spin up temporary disposable containers where all changes are discarded on exit (`sandbutter ephemeral`).
