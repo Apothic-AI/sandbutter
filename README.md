@@ -71,15 +71,10 @@ sudo zypper install -y btrfs-progs systemd-container
 
 ## Installation
 
-Clone the repository and make the script executable:
+Install `sandbutter` directly to `/usr/local/bin`:
 
 ```bash
-git clone <repo-url> sandbutter
-cd sandbutter
-chmod +x sandbutter
-
-# Optional: Symlink or install to your PATH
-sudo install -m 755 sandbutter /usr/local/bin/sandbutter
+sudo curl -fsSL https://raw.githubusercontent.com/Apothic-AI/sandbutter/master/sandbutter -o /usr/local/bin/sandbutter && sudo chmod +x /usr/local/bin/sandbutter
 ```
 
 ---
