@@ -36,6 +36,7 @@ Autonomous coding agents (such as Claude Code, Codex, Aider, OpenClaw, or Antigr
   - Safely excludes ephemeral and virtualization paths (`/.snapshots`, `/tmp`, `/var/log`, container pools).
   - Gracefully handles separate `/home` filesystems with automatic user environment provisioning.
 - 🩺 **Built-in Diagnostics**: Run `sandbutter check` to verify kernel, packages, filesystem UUIDs, and subvolume compatibility.
+- 🚀 **In-Place Upgrades**: Automatic lightweight check for new releases and single-command self-upgrades (`sandbutter upgrade`).
 - 🛡️ **Strict Safety Guardrails**: Path sanitization and containment checks prevent accidental host data loss or traversal.
 
 ---
@@ -150,6 +151,21 @@ sandbutter status dev-test
 sandbutter delete dev-test
 ```
 
+### 7. Upgrading sandbutter
+
+sandbutter automatically checks for new releases on invocation and prints a notice if an upgrade is available. You can upgrade in-place at any time:
+
+```bash
+# Upgrade in-place to latest version
+sandbutter upgrade
+
+# Force re-download / reinstall
+sandbutter upgrade --force
+
+# Check installed version
+sandbutter --version
+```
+
 ---
 
 ## Command Reference
@@ -171,7 +187,9 @@ Reflink / Data Commands:
   push <name> <path> [dst] Reflink-copy file/dir from host into sandbox
   diff <name> <path> [dst] Diff file/dir between host and sandbox
 
-Diagnostic Commands:
+Maintenance & Diagnostics:
+  upgrade [--force]        Upgrade sandbutter in-place to latest version
+  version, -v, --version   Show version information
   check                    Verify system packages and Btrfs filesystem support
 ```
 
@@ -181,6 +199,8 @@ Diagnostic Commands:
 
 - **`SANDBUTTER_MACHINES_DIR`**: Path where sandboxes are stored (default: `/var/lib/machines`). Must reside on the same Btrfs filesystem as `/` to allow instant CoW snapshots.
 - **`TARGET_USER`**: Target non-root user when using `enter` or `ephemeral` (default: `$SUDO_USER` or `$USER`).
+- **`SANDBUTTER_NO_UPGRADE_CHECK`**: Set to `1` or `true` to disable automatic upgrade checking.
+- **`SANDBUTTER_UPGRADE_URL`**: Custom raw script URL for upgrades (default: official GitHub repository).
 
 ---
 

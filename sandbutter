@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+VERSION="0.1.0"
+GITHUB_RAW_URL="${SANDBUTTER_UPGRADE_URL:-${SANDBUTTER_UPDATE_URL:-https://raw.githubusercontent.com/Apothic-AI/sandbutter/master/sandbutter}}"
+
 PROG_NAME="${0##*/}"
 PROG_NAME="${PROG_NAME:-sandbutter}"
 
@@ -22,12 +25,12 @@ MACHINES_DIR="${SANDBUTTER_MACHINES_DIR:-${MACHINES_DIR:-/var/lib/machines}}"
 MACHINES_DIR="${MACHINES_DIR%/}"
 TARGET_USER="${TARGET_USER:-${SUDO_USER:-$USER}}"
 
-# Ensure root execution
-if [[ $EUID -ne 0 ]]; then
-    exec sudo --preserve-env=SANDBUTTER_MACHINES_DIR,TARGET_USER,USER "$0" "$@"
-fi
+cmd_version() {
+    echo "sandbutter version $VERSION"
+}
 
 usage() {
+    local exit_code="${1:-1}"
     cat <<EOF
 Usage: $PROG_NAME <command> [arguments]
 
@@ -45,11 +48,35 @@ Reflink / Data Commands:
   push <name> <path> [dst] Reflink-copy file/dir from host into sandbox
   diff <name> <path> [dst] Diff file/dir between host and sandbox
 
-Diagnostic Commands:
+Maintenance & Diagnostics:
+  upgrade [--force]        Upgrade sandbutter in-place to latest version
+  version, -v, --version   Show version information
   check                    Verify system packages and Btrfs filesystem support
 EOF
-    exit 1
+    exit "$exit_code"
 }
+
+# Non-root commands and flags (bypass sudo elevation)
+case "${1:-}" in
+    -v|--version|version)
+        cmd_version
+        exit 0
+        ;;
+    -h|--help|help|"")
+        usage 0
+        ;;
+    create|enter|root|ephemeral|pull|push|diff|list|status|delete|check|doctor|upgrade|update)
+        ;;
+    *)
+        echo "Error: Unknown command '${1:-}'" >&2
+        usage 1
+        ;;
+esac
+
+# Ensure root execution
+if [[ $EUID -ne 0 ]]; then
+    exec sudo --preserve-env=SANDBUTTER_MACHINES_DIR,TARGET_USER,USER,SANDBUTTER_NO_UPGRADE_CHECK,SANDBUTTER_NO_UPDATE_CHECK,SANDBUTTER_UPGRADE_URL,SANDBUTTER_UPDATE_URL "$0" "$@"
+fi
 
 get_btrfs_uuid() {
     local target_path="$1"
@@ -744,6 +771,119 @@ cmd_delete() {
     return 0
 }
 
+version_gt() {
+    local v1 v2
+    v1="$(echo "$1" | sed -E 's/^[vV]//')"
+    v2="$(echo "$2" | sed -E 's/^[vV]//')"
+    [[ "$v1" != "$v2" ]] && [[ "$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | tail -n1)" == "$v1" ]]
+}
+
+check_for_upgrades() {
+    [[ "${SANDBUTTER_NO_UPGRADE_CHECK:-${SANDBUTTER_NO_UPDATE_CHECK:-0}}" =~ ^(1|true|yes)$ ]] && return 0
+
+    local cmd="${1:-}"
+    case "$cmd" in
+        upgrade|update|version|-v|--version|help|-h|--help) return 0 ;;
+    esac
+
+    command -v curl &>/dev/null || return 0
+
+    local remote_header
+    remote_header="$(curl -fsSL -r 0-4096 --connect-timeout 1 --max-time 2 "$GITHUB_RAW_URL" 2>/dev/null || true)"
+    [[ -z "$remote_header" ]] && return 0
+
+    local remote_version
+    remote_version="$(echo "$remote_header" | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)"
+    [[ -z "$remote_version" ]] && return 0
+
+    if version_gt "$remote_version" "$VERSION"; then
+        cat >&2 <<EOF
+
+[notice] An upgrade is available! sandbutter v$remote_version is now available (current: v$VERSION).
+[notice] Run 'sandbutter upgrade' to upgrade in-place.
+
+EOF
+    fi
+}
+
+cmd_upgrade() {
+    local force=0
+    for arg in "$@"; do
+        case "$arg" in
+            --force|-f) force=1 ;;
+        esac
+    done
+
+    command -v curl &>/dev/null || {
+        echo "Error: 'curl' is required to upgrade sandbutter." >&2
+        exit 1
+    }
+
+    local script_path
+    script_path="$(realpath "$0")"
+    if [[ ! -f "$script_path" || "$script_path" == *"/bash"* || "$script_path" == *"/sh"* ]]; then
+        echo "Error: Cannot determine script path to upgrade (running from pipe or subshell: $script_path)." >&2
+        exit 1
+    fi
+
+    echo "==> Checking for latest version at $GITHUB_RAW_URL..."
+    local temp_file
+    temp_file="$(mktemp "${script_path}.tmp.XXXXXX" 2>/dev/null || mktemp /tmp/sandbutter.upgrade.XXXXXX)"
+
+    if ! curl -fsSL --connect-timeout 10 "$GITHUB_RAW_URL" -o "$temp_file"; then
+        rm -f "$temp_file"
+        echo "Error: Failed to download upgrade from $GITHUB_RAW_URL" >&2
+        exit 1
+    fi
+
+    if [[ ! -s "$temp_file" ]]; then
+        rm -f "$temp_file"
+        echo "Error: Downloaded upgrade file is empty." >&2
+        exit 1
+    fi
+
+    if ! head -n 1 "$temp_file" | grep -q '^#!/usr/bin/env bash'; then
+        rm -f "$temp_file"
+        echo "Error: Downloaded file is not a valid bash script." >&2
+        exit 1
+    fi
+
+    if ! bash -n "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
+        echo "Error: Downloaded file failed bash syntax validation." >&2
+        exit 1
+    fi
+
+    local remote_version
+    remote_version="$(grep -m1 '^VERSION=' "$temp_file" | cut -d'"' -f2 || true)"
+    if [[ -z "$remote_version" ]]; then
+        rm -f "$temp_file"
+        echo "Error: Downloaded file does not declare a valid VERSION." >&2
+        exit 1
+    fi
+
+    if [[ $force -eq 0 ]] && ! version_gt "$remote_version" "$VERSION"; then
+        rm -f "$temp_file"
+        echo "sandbutter is already up to date (current: v$VERSION, remote: v$remote_version)."
+        echo "Run 'sandbutter upgrade --force' to reinstall."
+        return 0
+    fi
+
+    chmod --reference="$script_path" "$temp_file" 2>/dev/null || chmod 755 "$temp_file"
+    chown --reference="$script_path" "$temp_file" 2>/dev/null || true
+
+    if ! mv -f "$temp_file" "$script_path"; then
+        rm -f "$temp_file"
+        echo "Error: Failed to replace '$script_path'. Check permissions." >&2
+        exit 1
+    fi
+
+    echo "==> Successfully upgraded sandbutter to v$remote_version ($script_path)."
+    return 0
+}
+
+check_for_upgrades "$@"
+
 case "${1:-}" in
     create)        cmd_create "${2:-}" ;;
     enter)         cmd_enter "${2:-}" "${@:3}" ;;
@@ -756,6 +896,8 @@ case "${1:-}" in
     status)        cmd_status "${2:-}" ;;
     delete)        cmd_delete "${2:-}" ;;
     check|doctor)  cmd_check ;;
-    -h|--help|help) usage ;;
-    *)             usage ;;
+    upgrade|update) cmd_upgrade "${@:2}" ;;
+    version|-v|--version) cmd_version ;;
+    -h|--help|help) usage 0 ;;
+    *)             usage 1 ;;
 esac
